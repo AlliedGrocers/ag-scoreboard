@@ -1,0 +1,423 @@
+// AG Sales Scoreboard — build script.
+// Pulls the ClickUp "Daily Scoreboard" list and regenerates index.html.
+// Runs in GitHub Actions each morning. Locally (no token) it reads fixture.json.
+import fs from 'node:fs';
+
+const LIST_ID = '901327951985';
+const TOKEN = process.env.CLICKUP_TOKEN;
+
+// Custom-field IDs (from the Daily Scoreboard list)
+const F = {
+  rep:        '544344d7-c20d-4987-a647-e778e370aa86',
+  entry:      'd98adefb-0666-46e9-9be9-f01623cb65ed',
+  warmDials:  '25b5e5e2-7e13-49bb-8355-9458d21f2c67',
+  warmLanded: '485f11d3-ac33-4b4c-b2b4-dc7569e12729',
+  enroll:     '17b5ffe1-ef10-4f90-98d9-ca5ae0e37c54'
+};
+const REP_ORDER = ['Max', 'Andreas', 'Angelo'];
+const REP_KEY = { Max: 'max', Andreas: 'andreas', Angelo: 'angelo' };
+const REP_FALLBACK = { 0: 'Max', 1: 'Andreas', 2: 'Angelo' };
+const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const DOW = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+
+async function getTasks() {
+  if (!TOKEN) {
+    if (process.env.CI) throw new Error('CLICKUP_TOKEN secret is not set — refusing to build from stale fixture in CI.');
+    console.log('No CLICKUP_TOKEN — reading fixture.json (local test mode).');
+    return JSON.parse(fs.readFileSync('fixture.json', 'utf8')).tasks;
+  }
+  let page = 0, all = [];
+  while (true) {
+    const url = `https://api.clickup.com/api/v2/list/${LIST_ID}/task?include_closed=true&subtasks=true&page=${page}`;
+    const r = await fetch(url, { headers: { Authorization: TOKEN } });
+    if (!r.ok) throw new Error('ClickUp API ' + r.status + ': ' + (await r.text()));
+    const j = await r.json();
+    all = all.concat(j.tasks || []);
+    if (j.last_page === true || (j.tasks || []).length === 0) break;
+    if (++page > 50) break;
+  }
+  console.log('Fetched ' + all.length + ' tasks from ClickUp.');
+  return all;
+}
+
+function cf(task, id) {
+  const f = (task.custom_fields || []).find(x => x.id === id);
+  return f ? f.value : undefined;
+}
+function num(v) { const n = Number(v); return isFinite(n) ? n : 0; }
+
+function repName(task) {
+  const f = (task.custom_fields || []).find(x => x.id === F.rep);
+  if (!f || f.value === undefined || f.value === null) return null;
+  const idx = Number(f.value);
+  if (f.type_config && Array.isArray(f.type_config.options)) {
+    const opt = f.type_config.options.find(o => o.orderindex === idx);
+    if (opt) return opt.name;
+  }
+  return REP_FALLBACK[idx] ?? null;
+}
+
+function transform(tasks) {
+  const rows = [];
+  for (const t of tasks) {
+    const rep = repName(t);
+    const ems = cf(t, F.entry);
+    if (!rep || !ems) continue;
+    rows.push({
+      rep, ms: Number(ems),
+      warmDials: num(cf(t, F.warmDials)),
+      warmLanded: num(cf(t, F.warmLanded)),
+      enroll: num(cf(t, F.enroll))
+    });
+  }
+  if (!rows.length) throw new Error('No usable rows (rep + entry date) found.');
+
+  const dayMs = [...new Set(rows.map(r => r.ms))].sort((a, b) => a - b);
+  const days = dayMs.map(ms => {
+    const d = new Date(ms);
+    return { label: MONTHS[d.getUTCMonth()] + ' ' + d.getUTCDate(), dayName: DOW[d.getUTCDay()] };
+  });
+
+  const names = [...new Set(rows.map(r => r.rep))].sort((a, b) => {
+    const ia = REP_ORDER.indexOf(a), ib = REP_ORDER.indexOf(b);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  const reps = names.map(name => ({
+    key: REP_KEY[name] || name.toLowerCase().replace(/[^a-z0-9]/g, ''),
+    name,
+    dials: dayMs.map(ms => { const r = rows.find(x => x.rep === name && x.ms === ms); return r ? r.warmDials : 0; }),
+    landed: dayMs.map(ms => { const r = rows.find(x => x.rep === name && x.ms === ms); return r ? r.warmLanded : 0; }),
+    enroll: rows.filter(x => x.rep === name).reduce((s, x) => s + x.enroll, 0)
+  }));
+
+  const y0 = new Date(dayMs[0]).getUTCFullYear();
+  const windowLabel = days[0].label + ' – ' + days[days.length - 1].label + ', ' + y0 + ' · ' + days.length + ' selling day' + (days.length === 1 ? '' : 's');
+
+  return { generatedMs: Date.now(), windowLabel, days, reps };
+}
+
+function render(DATA) {
+  return TEMPLATE.replace('__DATA_JSON__', JSON.stringify(DATA));
+}
+
+// ---------------------------------------------------------------------------
+const TEMPLATE = `<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AG Sales Scoreboard</title>
+<style>
+  :root{color-scheme:light;--page:#f9f9f7;--surface:#fcfcfb;--text:#0b0b0b;--text2:#52514e;--muted:#898781;--grid:#e1e0d9;--baseline:#c3c2b7;--border:rgba(11,11,11,0.10);--max:#2a78d6;--andreas:#eb6834;--angelo:#1baf7a;--good:#006300;--track:#eef0ef;--dim:#c7c6c0;--shadow:0 1px 2px rgba(11,11,11,.04),0 4px 16px rgba(11,11,11,.05);--chip:#f1f1ee;}
+  :root[data-theme="dark"]{color-scheme:dark;--page:#0d0d0d;--surface:#1a1a19;--text:#ffffff;--text2:#c3c2b7;--muted:#898781;--grid:#2c2c2a;--baseline:#383835;--border:rgba(255,255,255,0.10);--max:#3987e5;--andreas:#d95926;--angelo:#199e70;--good:#0ca30c;--track:#242423;--dim:#3a3a37;--shadow:0 1px 2px rgba(0,0,0,.3),0 4px 20px rgba(0,0,0,.35);--chip:#242423;}
+  *{box-sizing:border-box}html,body{margin:0}
+  body{background:var(--page);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;-webkit-font-smoothing:antialiased;line-height:1.45;padding:28px 20px 56px}
+  .wrap{max-width:1120px;margin:0 auto}
+  header.top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:18px}
+  .htitle h1{font-size:22px;font-weight:650;letter-spacing:-.01em;margin:0}
+  .htitle p{margin:4px 0 0;color:var(--text2);font-size:13.5px}
+  .htitle .win{color:var(--muted)}
+  .toggle{display:inline-flex;align-items:center;gap:7px;cursor:pointer;border:1px solid var(--border);background:var(--surface);color:var(--text2);border-radius:9px;padding:7px 11px;font:inherit;font-size:12.5px;box-shadow:var(--shadow)}
+  .toggle:hover{color:var(--text)}
+  .repbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+  .repbar .cap{font-size:11.5px;font-weight:560;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin-right:2px}
+  .segmented{display:inline-flex;background:var(--chip);border:1px solid var(--border);border-radius:11px;padding:3px;gap:2px}
+  .seg{display:inline-flex;align-items:center;gap:7px;border:none;background:transparent;color:var(--text2);cursor:pointer;font:inherit;font-size:13px;font-weight:540;padding:6px 13px;border-radius:8px;transition:background .15s,color .15s}
+  .seg:hover{color:var(--text)}
+  .seg[aria-pressed="true"]{background:var(--surface);color:var(--text);box-shadow:var(--shadow)}
+  .seg .dot{width:9px;height:9px;border-radius:50%}
+  .kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:16px}
+  .tile{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:15px 16px 13px;box-shadow:var(--shadow);position:relative;overflow:hidden}
+  .tile .lab{font-size:11.5px;font-weight:560;letter-spacing:.03em;text-transform:uppercase;color:var(--muted)}
+  .tile .val{font-size:34px;font-weight:660;letter-spacing:-.02em;margin-top:3px;line-height:1.05;transition:color .2s}
+  .tile .val .u{font-size:20px;font-weight:600}
+  .tile .sub{font-size:12px;color:var(--text2);margin-top:3px;min-height:16px}
+  .tile.lead .val{color:var(--accent,var(--max))}
+  .spark{position:absolute;right:12px;bottom:11px;opacity:.9}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow)}
+  .card h2{font-size:14px;font-weight:620;margin:0;letter-spacing:-.005em}
+  .card .hint{font-size:12px;color:var(--muted);margin:2px 0 14px}
+  .lead-row{display:grid;grid-template-columns:74px 1fr;gap:10px;align-items:center;margin:0 0 14px;cursor:pointer;border-radius:8px;transition:opacity .2s}
+  .lead-row:last-child{margin-bottom:2px}
+  .lead-row.dimmed{opacity:.4}
+  .lead-name{display:flex;align-items:center;gap:7px;font-size:13px;font-weight:560}
+  .dot{width:9px;height:9px;border-radius:50%;flex:none}
+  .bar-area{position:relative}
+  .bar-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px}
+  .bar-metric{font-size:12px;color:var(--text2)}
+  .bar-metric b{color:var(--text);font-weight:600}
+  .bar-track{height:14px;background:var(--track);border-radius:7px;overflow:hidden}
+  .bar-fill{height:100%;border-radius:7px;min-width:6px;transition:width .6s cubic-bezier(.4,0,.2,1)}
+  .bar-val{font-size:12.5px;font-weight:640;font-variant-numeric:tabular-nums}
+  .chartbox{position:relative}
+  svg.line{width:100%;height:auto;display:block;overflow:visible}
+  .axtxt{fill:var(--muted);font-size:11px;font-family:inherit}
+  .gridln{stroke:var(--grid);stroke-width:1}
+  .baseln{stroke:var(--baseline);stroke-width:1}
+  .lseg{fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  .lmark{stroke:var(--surface);stroke-width:2}
+  .lmark-hit{fill:transparent;cursor:pointer}
+  .legend{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+  .lg{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text2);cursor:pointer;padding:2px 6px;border-radius:6px}
+  .lg:hover{background:var(--chip)}
+  .lg.dimmed{opacity:.45}
+  .tip{position:fixed;pointer-events:none;z-index:20;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:9px;box-shadow:var(--shadow);padding:8px 10px;font-size:12px;opacity:0;transform:translateY(-4px);transition:opacity .1s;white-space:nowrap}
+  .tip .tt{font-weight:620;margin-bottom:3px;font-size:12px}
+  .tip .tr{display:flex;align-items:center;gap:7px;color:var(--text2)}
+  .tip .tr b{color:var(--text);font-weight:600;font-variant-numeric:tabular-nums;margin-left:auto}
+  .tablecard{margin-bottom:14px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:9px 10px;text-align:right;font-variant-numeric:tabular-nums}
+  th:first-child,td:first-child{text-align:left}
+  th{font-size:11px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border)}
+  td{border-bottom:1px solid var(--grid)}
+  .dayhdr td{padding-top:14px;font-weight:620;color:var(--text);text-transform:none;letter-spacing:0;font-size:12.5px;border-bottom:1px solid var(--grid)}
+  .repcell{display:inline-flex;align-items:center;gap:7px}
+  .subtle{color:var(--muted)}
+  tr.totals td{border-top:2px solid var(--border);border-bottom:none;font-weight:640;padding-top:12px}
+  .ratepill{font-weight:600;font-variant-numeric:tabular-nums}
+  footer{color:var(--muted);font-size:12px;line-height:1.6;margin-top:6px}
+  footer .flag{color:var(--text2)}
+  a.src{color:var(--max);text-decoration:none}
+  a.src:hover{text-decoration:underline}
+  @media(max-width:820px){.kpis{grid-template-columns:repeat(2,1fr)}.grid2{grid-template-columns:1fr}}
+  @media(max-width:460px){.kpis{grid-template-columns:1fr 1fr}.tile .val{font-size:28px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="htitle">
+      <h1>AG Sales Scoreboard</h1>
+      <p>Warm-outreach activity &nbsp;&middot;&nbsp; <span class="win" id="winLabel"></span></p>
+    </div>
+    <button class="toggle" id="themeBtn" aria-label="Toggle dark mode"><span id="themeIcon">&#9680;</span><span id="themeLabel">Dark</span></button>
+  </header>
+  <div class="repbar"><span class="cap">View</span><div class="segmented" id="repSeg" role="group" aria-label="Filter by rep"></div></div>
+  <section class="kpis">
+    <div class="tile lead"><div class="lab">Warm Dials</div><div class="val" id="kDials">0</div><div class="sub" id="kDialsSub"></div><svg class="spark" width="66" height="26" viewBox="0 0 66 26" id="sparkDials"></svg></div>
+    <div class="tile"><div class="lab">Warm Landed</div><div class="val" id="kLanded">0</div><div class="sub" id="kLandedSub"></div><svg class="spark" width="66" height="26" viewBox="0 0 66 26" id="sparkLanded"></svg></div>
+    <div class="tile"><div class="lab">Land Rate</div><div class="val" id="kRate">0<span class="u">%</span></div><div class="sub" id="kRateSub"></div></div>
+    <div class="tile"><div class="lab">Enrollments</div><div class="val" id="kEnroll">0</div><div class="sub" id="kEnrollSub"></div></div>
+  </section>
+  <div class="grid2">
+    <div class="card"><h2>Warm dials by rep</h2><p class="hint">Click a rep to filter the whole board. Landed and land rate shown per rep.</p><div id="leaderboard"></div></div>
+    <div class="card chartbox"><h2 id="lineTitle">Daily warm dials</h2><p class="hint" id="lineHint">Across the selling days logged.</p><div id="lineChart"></div><div class="legend" id="lineLegend"></div></div>
+  </div>
+  <div class="card tablecard">
+    <div style="margin-bottom:12px"><h2 style="display:inline">Rep detail</h2> <span class="hint" id="tblSub" style="margin-left:8px">newest day first</span></div>
+    <table><thead><tr><th>Rep</th><th>Warm dials</th><th>Landed</th><th>Land rate</th></tr></thead><tbody id="tblBody"></tbody></table>
+  </div>
+  <footer>
+    <div class="flag">Cold Dials, Cold Landed and Warm Converts are 0 across every row — not logged in this list yet, so they are left off on purpose.</div>
+    <div>Source: ClickUp &middot; <a class="src" href="https://app.clickup.com/9013580833/v/l/li/901327951985" target="_blank" rel="noopener">Daily Scoreboard</a> &middot; <span id="updated"></span></div>
+  </footer>
+</div>
+<div class="tip" id="tip"></div>
+<script>
+(function(){
+  "use strict";
+  var DATA = __DATA_JSON__;
+  function gv(n){return getComputedStyle(document.documentElement).getPropertyValue(n).trim();}
+  function add(a,b){return a+b;}
+  function pct(x){return Math.round(x*100)+"%";}
+  function el(t,c){var e=document.createElement(t);if(c)e.className=c;return e;}
+
+  var days = DATA.days.map(function(d){return d.label;});
+  var dayName = DATA.days.map(function(d){return d.dayName;});
+  var reps = DATA.reps.map(function(r){
+    var x={key:r.key,name:r.name,dials:r.dials,landed:r.landed,enroll:r.enroll};
+    x.tDials=r.dials.reduce(add,0); x.tLanded=r.landed.reduce(add,0);
+    x.rate=x.tDials?x.tLanded/x.tDials:0; return x;
+  });
+  var team={
+    dials: days.map(function(_,i){return reps.reduce(function(s,r){return s+r.dials[i];},0);}),
+    landed: days.map(function(_,i){return reps.reduce(function(s,r){return s+r.landed[i];},0);})
+  };
+  team.tDials=team.dials.reduce(add,0); team.tLanded=team.landed.reduce(add,0);
+  team.rate=team.tDials?team.tLanded/team.tDials:0;
+  team.enroll=reps.reduce(function(s,r){return s+r.enroll;},0);
+  var enrollContribs=reps.filter(function(r){return r.enroll>0;});
+
+  function colorOf(k){return gv('--'+k);}
+  var sel="all";
+
+  document.getElementById('winLabel').textContent = DATA.windowLabel;
+  (function(){
+    var d=new Date(DATA.generatedMs);
+    var mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][d.getUTCMonth()];
+    document.getElementById('updated').textContent='Updated '+mo+' '+d.getUTCDate()+', '+d.getUTCFullYear()+' (auto-refreshes each morning)';
+  })();
+
+  var seg=document.getElementById("repSeg");
+  function segBtn(key,label,color){
+    var b=document.createElement("button");
+    b.className="seg"; b.setAttribute("aria-pressed", key===sel?"true":"false"); b.dataset.key=key;
+    b.innerHTML=(color?'<span class="dot" style="background:'+color+'"></span>':'')+label;
+    b.addEventListener("click",function(){ setSel(key); }); return b;
+  }
+  function buildSeg(){
+    seg.innerHTML="";
+    seg.appendChild(segBtn("all","All reps",null));
+    reps.forEach(function(r){ seg.appendChild(segBtn(r.key,r.name,colorOf(r.key))); });
+  }
+  function setSel(key){ sel=key; seg.querySelectorAll(".seg").forEach(function(b){b.setAttribute("aria-pressed", b.dataset.key===sel?"true":"false");}); render(); }
+
+  function set(id,v){document.getElementById(id).textContent=v;}
+  function setHTML(id,v){document.getElementById(id).innerHTML=v;}
+  function txt(id,v){document.getElementById(id).textContent=v;}
+
+  function renderKPI(){
+    var accent;
+    if(sel==="all"){
+      accent=colorOf(reps[0]?reps[0].key:'max');
+      set("kDials",team.tDials); set("kLanded",team.tLanded);
+      setHTML("kRate", Math.round(team.rate*100)+'<span class="u">%</span>');
+      set("kEnroll",team.enroll);
+      txt("kDialsSub","team total · "+days.length+" day"+(days.length===1?"":"s"));
+      txt("kLandedSub","connected conversations");
+      txt("kRateSub", team.tLanded+" landed ÷ "+team.tDials+" dials");
+      txt("kEnrollSub", team.enroll===0?"none yet":(enrollContribs.length===1?("all by "+enrollContribs[0].name):"team total"));
+      drawSpark("sparkDials",team.dials,colorOf(reps[0]?reps[0].key:'max'));
+      drawSpark("sparkLanded",team.landed,colorOf(reps[1]?reps[1].key:'andreas'));
+    } else {
+      var r=reps.filter(function(x){return x.key===sel;})[0];
+      accent=colorOf(r.key);
+      set("kDials",r.tDials); set("kLanded",r.tLanded);
+      setHTML("kRate", Math.round(r.rate*100)+'<span class="u">%</span>');
+      set("kEnroll",r.enroll);
+      txt("kDialsSub",r.name+" · "+days.length+" day"+(days.length===1?"":"s"));
+      txt("kLandedSub",r.name+" · connected");
+      txt("kRateSub", r.tLanded+" landed ÷ "+r.tDials+" dials");
+      txt("kEnrollSub", r.enroll?("released by "+r.name):"none released");
+      drawSpark("sparkDials",r.dials,colorOf(r.key));
+      drawSpark("sparkLanded",r.landed,colorOf(r.key));
+    }
+    document.querySelector(".tile.lead .val").style.setProperty("--accent",accent);
+  }
+
+  function drawSpark(id,arr,color){
+    var w=66,h=26,pad=3,mx=Math.max.apply(null,arr),mn=Math.min.apply(null,arr),rng=(mx-mn)||1;
+    if(arr.length<2){document.getElementById(id).innerHTML='';return;}
+    var pts=arr.map(function(v,i){return [pad+(w-2*pad)*(i/(arr.length-1)), h-pad-(h-2*pad)*((v-mn)/rng)];});
+    var d=pts.map(function(p,i){return (i?"L":"M")+p[0].toFixed(1)+" "+p[1].toFixed(1);}).join(" ");
+    var last=pts[pts.length-1];
+    document.getElementById(id).innerHTML='<path d="'+d+'" fill="none" stroke="'+color+'" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" opacity="0.85"/><circle cx="'+last[0].toFixed(1)+'" cy="'+last[1].toFixed(1)+'" r="2.2" fill="'+color+'"/>';
+  }
+
+  var lb=document.getElementById("leaderboard");
+  function renderLeaderboard(){
+    lb.innerHTML="";
+    var maxD=Math.max.apply(null,reps.map(function(r){return r.tDials;}))||1;
+    reps.slice().sort(function(a,b){return b.tDials-a.tDials;}).forEach(function(r){
+      var dimmed=(sel!=="all" && sel!==r.key);
+      var row=el("div","lead-row"+(dimmed?" dimmed":""));
+      row.innerHTML='<div class="lead-name"><span class="dot" style="background:'+colorOf(r.key)+'"></span>'+r.name+'</div><div class="bar-area"><div class="bar-top"><span class="bar-metric">landed <b>'+r.tLanded+'</b> · rate <b>'+pct(r.rate)+'</b></span><span class="bar-val">'+r.tDials+'</span></div><div class="bar-track"><div class="bar-fill" style="width:'+(r.tDials/maxD*100).toFixed(1)+'%;background:'+colorOf(r.key)+'"></div></div></div>';
+      row.addEventListener("click",function(){ setSel(sel===r.key?"all":r.key); });
+      var area=row.querySelector(".bar-area");
+      area.addEventListener("mousemove",function(e){ showTip(e,r.name,[["Warm dials",r.tDials,colorOf(r.key)],["Landed",r.tLanded,null],["Land rate",pct(r.rate),null]]); });
+      area.addEventListener("mouseleave",hideTip);
+      lb.appendChild(row);
+    });
+  }
+
+  function niceCeil(v){ if(v<=1)return 1; var pow=Math.pow(10,Math.floor(Math.log10(v))); var n=v/pow; var m; if(n<=1)m=1;else if(n<=2)m=2;else if(n<=5)m=5;else m=10; return m*pow; }
+
+  function renderLine(){
+    var host=document.getElementById("lineChart");
+    var maxDaily=Math.max(1, Math.max.apply(null, reps.map(function(r){return Math.max.apply(null,r.dials);})));
+    var step=niceCeil(Math.ceil(maxDaily/4)); var yMax=step*Math.ceil(maxDaily/step);
+    var ticks=[]; for(var v=0; v<=yMax+0.001; v+=step) ticks.push(v);
+    var W=520,H=240,m={t:14,r:16,b:28,l:30},iw=W-m.l-m.r,ih=H-m.t-m.b,xN=days.length;
+    var xAt=function(i){return m.l+(xN===1?iw/2:iw*(i/(xN-1)));};
+    var yAt=function(vv){return m.t+ih-ih*(vv/yMax);};
+    var svg='<svg class="line" viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Daily warm dials">';
+    ticks.forEach(function(vv){var y=yAt(vv);svg+='<line class="'+(vv===0?"baseln":"gridln")+'" x1="'+m.l+'" y1="'+y.toFixed(1)+'" x2="'+(W-m.r)+'" y2="'+y.toFixed(1)+'"/>';svg+='<text class="axtxt" x="'+(m.l-7)+'" y="'+(y+3.5).toFixed(1)+'" text-anchor="end">'+vv+'</text>';});
+    days.forEach(function(d,i){ svg+='<text class="axtxt" x="'+xAt(i).toFixed(1)+'" y="'+(H-9)+'" text-anchor="middle">'+d+'</text>'; });
+    reps.forEach(function(r){
+      var dimmed=(sel!=="all" && sel!==r.key);
+      var stroke=dimmed?gv('--dim'):colorOf(r.key);
+      var d=r.dials.map(function(vv,i){return (i?"L":"M")+xAt(i).toFixed(1)+" "+yAt(vv).toFixed(1);}).join(" ");
+      svg+='<path class="lseg" d="'+d+'" stroke="'+stroke+'" opacity="'+(dimmed?0.7:1)+'"/>';
+    });
+    reps.forEach(function(r){
+      var dimmed=(sel!=="all" && sel!==r.key); if(dimmed) return;
+      r.dials.forEach(function(vv,i){
+        var cx=xAt(i).toFixed(1),cy=yAt(vv).toFixed(1);
+        svg+='<circle class="lmark" cx="'+cx+'" cy="'+cy+'" r="4" fill="'+colorOf(r.key)+'"/>';
+        svg+='<circle class="lmark-hit" cx="'+cx+'" cy="'+cy+'" r="13" data-rep="'+r.name+'" data-day="'+days[i]+'" data-val="'+vv+'" data-color="'+colorOf(r.key)+'"/>';
+      });
+    });
+    svg+='</svg>';
+    host.innerHTML=svg;
+    host.querySelectorAll(".lmark-hit").forEach(function(h){
+      h.addEventListener("mousemove",function(e){ showTip(e,h.dataset.day,[[h.dataset.rep+" · warm dials",h.dataset.val,h.dataset.color]]); });
+      h.addEventListener("mouseleave",hideTip);
+    });
+    var lg=document.getElementById("lineLegend"); lg.innerHTML="";
+    var allBtn=el("span","lg"+(sel==="all"?"":" dimmed")); allBtn.innerHTML='<span class="dot" style="background:'+gv('--muted')+'"></span>All'; allBtn.addEventListener("click",function(){setSel("all");}); lg.appendChild(allBtn);
+    reps.forEach(function(r){ var dimmed=(sel!=="all" && sel!==r.key); var s=el("span","lg"+(dimmed?" dimmed":"")); s.innerHTML='<span class="dot" style="background:'+colorOf(r.key)+'"></span>'+r.name; s.addEventListener("click",function(){ setSel(sel===r.key?"all":r.key); }); lg.appendChild(s); });
+    document.getElementById("lineTitle").textContent = sel==="all" ? "Daily warm dials" : "Daily warm dials · "+reps.filter(function(x){return x.key===sel;})[0].name;
+  }
+
+  function ratePill(rt,dl){ if(!dl) return '<span class="subtle">—</span>'; return '<span class="ratepill">'+pct(rt)+'</span>'; }
+  function rowFor(r,di){
+    var dl=r.dials[di],ld=r.landed[di],rt=dl?ld/dl:0;
+    var tr=document.createElement("tr");
+    tr.innerHTML='<td><span class="repcell"><span class="dot" style="background:'+colorOf(r.key)+'"></span>'+r.name+'</span></td><td>'+dl+'</td><td>'+ld+'</td><td>'+ratePill(rt,dl)+'</td>';
+    return tr;
+  }
+  function renderTable(){
+    var body=document.getElementById("tblBody"); body.innerHTML="";
+    var order=days.map(function(_,i){return i;}).reverse();
+    if(sel==="all"){
+      document.getElementById("tblSub").textContent="newest day first";
+      order.forEach(function(di){
+        var hdr=document.createElement("tr"); hdr.className="dayhdr";
+        hdr.innerHTML='<td colspan="4">'+days[di]+' · '+dayName[di]+'</td>'; body.appendChild(hdr);
+        reps.slice().sort(function(a,b){return b.dials[di]-a.dials[di];}).forEach(function(r){ body.appendChild(rowFor(r,di)); });
+      });
+      var tr=document.createElement("tr"); tr.className="totals";
+      tr.innerHTML='<td>Team total</td><td>'+team.tDials+'</td><td>'+team.tLanded+'</td><td><span class="ratepill">'+pct(team.rate)+'</span></td>'; body.appendChild(tr);
+    } else {
+      var r=reps.filter(function(x){return x.key===sel;})[0];
+      document.getElementById("tblSub").textContent=r.name+" · newest day first";
+      order.forEach(function(di){
+        var dl=r.dials[di],ld=r.landed[di],rt=dl?ld/dl:0;
+        var tr=document.createElement("tr");
+        tr.innerHTML='<td><span class="repcell"><span class="dot" style="background:'+colorOf(r.key)+'"></span>'+days[di]+' · '+dayName[di]+'</span></td><td>'+dl+'</td><td>'+ld+'</td><td>'+ratePill(rt,dl)+'</td>';
+        body.appendChild(tr);
+      });
+      var tot=document.createElement("tr"); tot.className="totals";
+      tot.innerHTML='<td>'+r.name+' total</td><td>'+r.tDials+'</td><td>'+r.tLanded+'</td><td><span class="ratepill">'+pct(r.rate)+'</span></td>'; body.appendChild(tot);
+    }
+  }
+
+  var tip=document.getElementById("tip");
+  function showTip(e,title,rows){
+    var html='<div class="tt">'+title+'</div>';
+    rows.forEach(function(r){ var sw=r[2]?'<span class="dot" style="background:'+r[2]+'"></span>':''; html+='<div class="tr">'+sw+'<span>'+r[0]+'</span><b>'+r[1]+'</b></div>'; });
+    tip.innerHTML=html; tip.style.opacity="1";
+    var pad=14,tw=tip.offsetWidth,th=tip.offsetHeight,x=e.clientX+pad,y=e.clientY+pad;
+    if(x+tw>window.innerWidth-8)x=e.clientX-tw-pad; if(y+th>window.innerHeight-8)y=e.clientY-th-pad;
+    tip.style.left=x+"px"; tip.style.top=y+"px";
+  }
+  function hideTip(){tip.style.opacity="0";}
+
+  function render(){ renderKPI(); renderLeaderboard(); renderLine(); renderTable(); }
+
+  var root=document.documentElement,btn=document.getElementById("themeBtn"),icon=document.getElementById("themeIcon"),lbl=document.getElementById("themeLabel");
+  if(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) applyTheme("dark");
+  btn.addEventListener("click",function(){ applyTheme(root.getAttribute("data-theme")==="dark"?"light":"dark"); });
+  function applyTheme(t){ root.setAttribute("data-theme",t); lbl.textContent=t==="dark"?"Light":"Dark"; icon.textContent=t==="dark"?"☀":"◐"; buildSeg(); render(); }
+
+  buildSeg(); render();
+})();
+</script>
+</body>
+</html>`;
+
+const DATA = transform(await getTasks());
+fs.writeFileSync('index.html', render(DATA));
+console.log('Built index.html — ' + DATA.reps.length + ' reps, ' + DATA.days.length + ' days.');
